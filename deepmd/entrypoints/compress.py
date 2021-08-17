@@ -1,16 +1,18 @@
 """Compress a model, which including tabulating the embedding-net."""
 
+import os
 import json
 import logging
 from typing import Optional
 
-from deepmd.common import j_loader
+from deepmd.env import tf
+from deepmd.common import j_loader, get_tensor_by_name, GLOBAL_TF_FLOAT_PRECISION
 from deepmd.utils.argcheck import normalize
 from deepmd.utils.compat import updata_deepmd_input
-from deepmd.utils.errors import GraphTooLargeError
+from deepmd.utils.errors import GraphTooLargeError, GraphWithoutTensorError
 
 from .freeze import freeze
-from .train import train
+from .train import train, get_rcut, get_min_nbor_dist
 from .transfer import transfer
 
 __all__ = ["compress"]
@@ -20,13 +22,13 @@ log = logging.getLogger(__name__)
 
 def compress(
     *,
-    INPUT: str,
     input: str,
     output: str,
     extrapolate: int,
     step: float,
     frequency: str,
     checkpoint_folder: str,
+    training_script: str,
     mpi_log: str,
     log_path: Optional[str],
     log_level: int,
@@ -42,8 +44,6 @@ def compress(
 
     Parameters
     ----------
-    INPUT : str
-        input json/yaml control file
     input : str
         frozen model file to compress
     output : str
@@ -56,6 +56,8 @@ def compress(
         frequency of tabulation overflow check
     checkpoint_folder : str
         trining checkpoint folder for freezing
+    training_script : str
+        training script of the input frozen model
     mpi_log : str
         mpi logging mode for training
     log_path : Optional[str]
@@ -63,21 +65,41 @@ def compress(
     log_level : int
         logging level
     """
-    jdata = j_loader(INPUT)
-    if "model" not in jdata.keys():
-        jdata = updata_deepmd_input(jdata, warning=True, dump="input_v2_compat.json")
+    try:
+        t_jdata = get_tensor_by_name(input, 'train_attr/training_script')
+        t_min_nbor_dist = get_tensor_by_name(input, 'train_attr/min_nbor_dist')
+        jdata = json.loads(t_jdata)
+    except GraphWithoutTensorError as e:
+        if training_script == None:
+            raise RuntimeError(
+                "The input frozen model: %s has no training script or min_nbor_dist information, "
+                "which is not supported by the model compression interface. "
+                "Please consider using the --training-script command within the model compression interface to provide the training script of the input frozen model. "
+                "Note that the input training script must contain the correct path to the training data." % input
+            ) from e
+        elif os.path.exists(training_script) == False:
+            raise RuntimeError(
+                "The input training script %s does not exist! Please check the path of the training script. " % (input + "(" + os.path.abspath(input) + ")")
+            ) from e
+        else:
+            log.info("stage 0: compute the min_nbor_dist")
+            jdata = j_loader(training_script)
+            t_min_nbor_dist = get_min_nbor_dist(jdata, get_rcut(jdata))
+
+    tf.constant(t_min_nbor_dist,
+        name = 'train_attr/min_nbor_dist',
+        dtype = GLOBAL_TF_FLOAT_PRECISION)
     jdata["model"]["compress"] = {}
     jdata["model"]["compress"]["type"] = 'se_e2_a'
     jdata["model"]["compress"]["compress"] = True
     jdata["model"]["compress"]["model_file"] = input
+    jdata["model"]["compress"]["min_nbor_dist"] = t_min_nbor_dist
     jdata["model"]["compress"]["table_config"] = [
         extrapolate,
         step,
         10 * step,
         int(frequency),
     ]
-    # be careful here, if one want to refine the model
-    jdata["training"]["numb_steps"] = jdata["training"]["save_freq"]
     jdata = normalize(jdata)
 
     # check the descriptor info of the input file
@@ -90,7 +112,7 @@ def compress(
 
     # stage 1: training or refining the model with tabulation
     log.info("\n\n")
-    log.info("stage 1: train or refine the model with tabulation")
+    log.info("stage 1: compress the model")
     control_file = "compress.json"
     with open(control_file, "w") as fp:
         json.dump(jdata, fp, indent=4)
@@ -103,6 +125,7 @@ def compress(
             mpi_log=mpi_log,
             log_level=log_level,
             log_path=log_path,
+            is_compress=True,
         )
     except GraphTooLargeError as e:
         raise RuntimeError(
